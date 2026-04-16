@@ -503,10 +503,11 @@ if result:
     if not missing_sap.empty:
         standort_zaehlung = (
             missing_sap.groupby("Standort", as_index=False)
-            .agg(
-                **{
-                    "Betroffene Kunden": ("SAP Nummer", "count"),
-                    "Fehlende Tage gesamt": ("Anzahl fehlender Tage", "sum"),
+            .agg({"SAP Nummer": "count", "Anzahl fehlender Tage": "sum"})
+            .rename(
+                columns={
+                    "SAP Nummer": "Betroffene Kunden",
+                    "Anzahl fehlender Tage": "Fehlende Tage gesamt",
                 }
             )
         )
