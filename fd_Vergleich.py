@@ -178,93 +178,49 @@ def read_tourenplanung(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
     return pd.concat(frames, ignore_index=True), sheet_names
 
 
-def build_missing_in_sap(
+def build_abweichungen(
     tour_df: pd.DataFrame,
     days_by_sap: Dict[str, Set[int]],
 ) -> pd.DataFrame:
-    """Eine Zeile pro Kunde: welche Tage stehen in der Tourenplanung, fehlen aber
-    in SAP als Liefertag."""
-    if tour_df.empty:
-        return _empty_result_df()
-
-    known = tour_df[tour_df["sap"].isin(SELECTED_SAPS)].copy()
-    if known.empty:
-        return _empty_result_df()
-
-    known["fehlt"] = known.apply(
-        lambda row: row["tag_num"] not in days_by_sap.get(row["sap"], set()),
-        axis=1,
-    )
-    missing = known[known["fehlt"]]
-    if missing.empty:
-        return _empty_result_df()
-
-    days_in_tour: Dict[str, Set[int]] = (
-        tour_df.groupby("sap")["tag_num"].agg(set).to_dict()
-    )
-
-    agg = missing.groupby("sap", as_index=False).agg(
-        tage=("tag_num", lambda x: sorted(set(x))),
-    )
-
-    agg["Standort"] = agg["sap"].map(CUSTOMER_TO_LOCATION).fillna("Ohne Zuordnung")
-    agg["Fehlende LT"] = agg["tage"].map(
-        lambda tage: ", ".join(f"{d} {DAY_NAMES[d]}" for d in tage)
-    )
-    agg["LT SAP"] = agg["sap"].map(
-        lambda s: ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(days_by_sap.get(s, set())))
-        or "(keine hinterlegt)"
-    )
-    agg["LT Tourenplanung"] = agg["sap"].map(
-        lambda s: ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(days_in_tour.get(s, set())))
-    )
-
-    agg["_StandortSort"] = agg["Standort"].map(LOCATION_ORDER).fillna(999)
-    agg["_SapSort"] = pd.to_numeric(agg["sap"], errors="coerce").fillna(9_999_999_999)
-    agg = agg.rename(columns={"sap": "SAP Nummer"}).sort_values(
-        ["_StandortSort", "_SapSort"]
-    ).reset_index(drop=True)
-
-    return agg[_export_columns_missing()]
-
-
-def build_missing_in_tour(
-    tour_df: pd.DataFrame,
-    days_by_sap: Dict[str, Set[int]],
-) -> pd.DataFrame:
-    """Eine Zeile pro Kunde: welche Tage sind in SAP als Liefertag hinterlegt,
-    fehlen aber in der Tourenplanung."""
+    """Eine Zeile pro Kunde mit mindestens einer Abweichung zwischen Tourenplanung
+    und SAP. Zeigt beide Richtungen nebeneinander."""
     days_in_tour: Dict[str, Set[int]] = {}
     if not tour_df.empty:
-        days_in_tour = tour_df.groupby("sap")["tag_num"].agg(set).to_dict()
+        known = tour_df[tour_df["sap"].isin(SELECTED_SAPS)]
+        if not known.empty:
+            days_in_tour = known.groupby("sap")["tag_num"].agg(set).to_dict()
 
     rows: List[dict] = []
-    for sap, sap_days in days_by_sap.items():
+    all_saps = set(days_by_sap.keys()) | set(days_in_tour.keys())
+
+    for sap in all_saps:
+        sap_days = days_by_sap.get(sap, set())
         tour_days = days_in_tour.get(sap, set())
-        fehlend = sorted(sap_days - tour_days)
-        if not fehlend:
+        zuviel_in_tour = sorted(tour_days - sap_days)
+        fehlt_in_tour = sorted(sap_days - tour_days)
+
+        if not zuviel_in_tour and not fehlt_in_tour:
             continue
+
         standort = CUSTOMER_TO_LOCATION.get(sap, "Ohne Zuordnung")
         rows.append({
             "Standort": standort,
             "SAP Nummer": sap,
-            "Fehlende LT": ", ".join(f"{d} {DAY_NAMES[d]}" for d in fehlend),
-            "LT SAP": ", ".join(
-                f"{d} {DAY_NAMES[d]}" for d in sorted(sap_days)
-            ),
-            "LT Tourenplanung": ", ".join(
-                f"{d} {DAY_NAMES[d]}" for d in sorted(tour_days)
-            ) or "(nicht in Tourenplanung vorhanden)",
+            "LT zuviel in Tour": ", ".join(f"{d} {DAY_NAMES[d]}" for d in zuviel_in_tour),
+            "LT fehlt in Tour": ", ".join(f"{d} {DAY_NAMES[d]}" for d in fehlt_in_tour),
+            "LT SAP": ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(sap_days))
+                or "(keine hinterlegt)",
+            "LT Tourenplanung": ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(tour_days))
+                or "(nicht vorhanden)",
             "_StandortSort": LOCATION_ORDER.get(standort, 999),
             "_SapSort": int(sap) if sap.isdigit() else 9_999_999_999,
         })
 
     if not rows:
-        return pd.DataFrame(columns=_export_columns_missing_tour())
+        return pd.DataFrame(columns=_export_columns_abweichungen())
 
-    df = pd.DataFrame(rows)
-    df = df.sort_values(["_StandortSort", "_SapSort"]).reset_index(drop=True)
-    return df[_export_columns_missing_tour()]
+    df = pd.DataFrame(rows).sort_values(["_StandortSort", "_SapSort"]).reset_index(drop=True)
+    return df[_export_columns_abweichungen()]
 
 
 def build_unknown_saps(tour_df: pd.DataFrame) -> pd.DataFrame:
@@ -289,28 +245,15 @@ def build_unknown_saps(tour_df: pd.DataFrame) -> pd.DataFrame:
     return agg[empty_cols]
 
 
-def _export_columns_missing() -> List[str]:
+def _export_columns_abweichungen() -> List[str]:
     return [
         "Standort",
         "SAP Nummer",
-        "Fehlende LT",
+        "LT zuviel in Tour",
+        "LT fehlt in Tour",
         "LT SAP",
         "LT Tourenplanung",
     ]
-
-
-def _export_columns_missing_tour() -> List[str]:
-    return [
-        "Standort",
-        "SAP Nummer",
-        "Fehlende LT",
-        "LT SAP",
-        "LT Tourenplanung",
-    ]
-
-
-def _empty_result_df() -> pd.DataFrame:
-    return pd.DataFrame(columns=_export_columns_missing())
 
 
 def interleave_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -327,22 +270,17 @@ def interleave_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_excel(
-    missing_sap: pd.DataFrame,
-    missing_tour: pd.DataFrame | None,
+    abweichungen: pd.DataFrame,
     unknown_saps: pd.DataFrame | None,
 ) -> bytes:
-    """Schreibt eine formatierte Excel-Datei mit bis zu drei Blättern.
-    Zwischen jedem Kunden wird eine Leerzeile eingefügt."""
+    """Schreibt eine formatierte Excel-Datei mit einem Abweichungs-Blatt plus
+    optional einem Blatt für unbekannte SAP-Nummern. Zwischen jedem Kunden
+    wird eine Leerzeile eingefügt."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        missing_sap_out = interleave_blank_rows(missing_sap)
-        missing_sap_out.to_excel(writer, index=False, sheet_name="Fehlt in SAP", na_rep="")
-        _format_sheet(writer, "Fehlt in SAP", missing_sap_out)
-
-        if missing_tour is not None:
-            missing_tour_out = interleave_blank_rows(missing_tour)
-            missing_tour_out.to_excel(writer, index=False, sheet_name="Fehlt in Tourenplanung", na_rep="")
-            _format_sheet(writer, "Fehlt in Tourenplanung", missing_tour_out)
+        abw_out = interleave_blank_rows(abweichungen)
+        abw_out.to_excel(writer, index=False, sheet_name="LT Abweichungen", na_rep="")
+        _format_sheet(writer, "LT Abweichungen", abw_out)
 
         if unknown_saps is not None and not unknown_saps.empty:
             unknown_out = interleave_blank_rows(unknown_saps)
@@ -414,8 +352,8 @@ st.info(
     "Richtung des Vergleichs:\n"
     "- SAP = Datei mit SAP Nummer in A und Liefertag in G\n"
     "- Tourenplanung = Datei mit Spalte B sowie Montag bis Samstag in G bis L\n"
-    "- Standard-Ausgabe = nur Tage, die in der Tourenplanung stehen, aber in SAP fehlen\n"
-    "- Sortierung = zuerst Malchow, dann Neumünster, dann Zarrentin"
+    "- Ausgabe = pro Kunde eine Zeile mit beiden Abweichungsrichtungen\n"
+    "- Sortierung = zuerst Malchow, dann Neumünster, dann Zarrentin, dann SAP-Nummer aufsteigend"
 )
 
 col1, col2, col3 = st.columns(3)
@@ -444,10 +382,6 @@ tourenplanung_datei = st.file_uploader(
 )
 
 with st.expander("Optionen", expanded=False):
-    include_reverse = st.checkbox(
-        "Zusätzlich prüfen: Tage, die in SAP stehen, aber in der Tourenplanung fehlen (eigenes Blatt)",
-        value=False,
-    )
     include_unknown = st.checkbox(
         "Unbekannte SAP-Nummern aus der Tourenplanung mit ausgeben (eigenes Blatt)",
         value=True,
@@ -464,16 +398,13 @@ if run:
         days_by_sap, sap_sheet, sap_rows = read_sap_file(sap_datei)
         tour_df, tour_sheets = read_tourenplanung(tourenplanung_datei)
 
-        missing_sap = build_missing_in_sap(tour_df, days_by_sap)
-        missing_tour = build_missing_in_tour(tour_df, days_by_sap) if include_reverse else None
+        abweichungen = build_abweichungen(tour_df, days_by_sap)
         unknown_saps = build_unknown_saps(tour_df) if include_unknown else None
 
-        excel_bytes = build_excel(missing_sap, missing_tour, unknown_saps)
+        excel_bytes = build_excel(abweichungen, unknown_saps)
 
-        # State halten, damit Download-Button kein Re-Run auslöst
         st.session_state["result"] = {
-            "missing_sap": missing_sap,
-            "missing_tour": missing_tour,
+            "abweichungen": abweichungen,
             "unknown_saps": unknown_saps,
             "excel_bytes": excel_bytes,
             "sap_sheet": sap_sheet,
@@ -487,13 +418,11 @@ if run:
 # Ergebnisanzeige
 result = st.session_state.get("result")
 if result:
-    missing_sap = result["missing_sap"]
-    missing_tour = result["missing_tour"]
+    abweichungen = result["abweichungen"]
     unknown_saps = result["unknown_saps"]
 
     st.success(
-        f"Fertig. {len(missing_sap)} Kunden mit Tagen in der Tourenplanung, "
-        f"die in SAP als Liefertag fehlen."
+        f"Fertig. {len(abweichungen)} Kunden mit Abweichungen zwischen SAP und Tourenplanung."
     )
 
     st.caption(
@@ -501,23 +430,30 @@ if result:
         f"Tourenplanung: geprüfte Blätter = {', '.join(result['tour_sheets'])}"
     )
 
-    if not missing_sap.empty:
+    if not abweichungen.empty:
+        zuviel_mask = abweichungen["LT zuviel in Tour"].astype(bool)
+        fehlt_mask = abweichungen["LT fehlt in Tour"].astype(bool)
+
         standort_zaehlung = (
-            missing_sap.groupby("Standort", as_index=False)
-            .agg({"SAP Nummer": "count"})
-            .rename(columns={"SAP Nummer": "Betroffene Kunden"})
+            abweichungen.assign(
+                _zuviel=zuviel_mask.astype(int),
+                _fehlt=fehlt_mask.astype(int),
+            )
+            .groupby("Standort", as_index=False)
+            .agg({"SAP Nummer": "count", "_zuviel": "sum", "_fehlt": "sum"})
+            .rename(columns={
+                "SAP Nummer": "Betroffene Kunden",
+                "_zuviel": "Kunden mit LT zuviel in Tour",
+                "_fehlt": "Kunden mit LT fehlt in Tour",
+            })
         )
         st.dataframe(standort_zaehlung, use_container_width=True, hide_index=True)
 
-        with st.expander("Vorschau: Fehlt in SAP", expanded=False):
-            standorte = ["Alle"] + sorted(missing_sap["Standort"].unique().tolist())
-            filter_wahl = st.selectbox("Standort filtern", standorte, key="filter_missing_sap")
-            vorschau = missing_sap if filter_wahl == "Alle" else missing_sap[missing_sap["Standort"] == filter_wahl]
+        with st.expander("Vorschau: LT Abweichungen", expanded=False):
+            standorte = ["Alle"] + sorted(abweichungen["Standort"].unique().tolist())
+            filter_wahl = st.selectbox("Standort filtern", standorte, key="filter_abw")
+            vorschau = abweichungen if filter_wahl == "Alle" else abweichungen[abweichungen["Standort"] == filter_wahl]
             st.dataframe(vorschau, use_container_width=True, hide_index=True)
-
-    if missing_tour is not None and not missing_tour.empty:
-        with st.expander(f"Vorschau: Fehlt in Tourenplanung ({len(missing_tour)} Kunden)", expanded=False):
-            st.dataframe(missing_tour, use_container_width=True, hide_index=True)
 
     if unknown_saps is not None and not unknown_saps.empty:
         with st.expander(f"Vorschau: Unbekannte SAP-Nummern ({len(unknown_saps)} Kunden)", expanded=False):
@@ -526,6 +462,6 @@ if result:
     st.download_button(
         label="Excel herunterladen",
         data=result["excel_bytes"],
-        file_name="tourenplanung_tage_fehlen_in_sap_sortiert.xlsx",
+        file_name="lt_abweichungen_sap_vs_tourenplanung.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
