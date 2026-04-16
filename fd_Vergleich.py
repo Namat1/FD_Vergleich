@@ -1,10 +1,8 @@
 import io
-from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple
 
 import pandas as pd
 import streamlit as st
-
 
 DEFAULT_SAP_TEXT = """213568
 112681
@@ -158,69 +156,50 @@ DAY_NAMES = {
     6: "Samstag",
 }
 
+# pandas benutzt nullbasierte Spaltenindizes
 DAY_COLUMNS_FILE2 = {
-    1: 6,   # Spalte G
-    2: 7,   # Spalte H
-    3: 8,   # Spalte I
-    4: 9,   # Spalte J
-    5: 10,  # Spalte K
-    6: 11,  # Spalte L
+    1: 6,   # G
+    2: 7,   # H
+    3: 8,   # I
+    4: 9,   # J
+    5: 10,  # K
+    6: 11,  # L
 }
 
 
-@dataclass
-class CompareResult:
-    zusammenfassung: pd.DataFrame
-    tagesabweichungen: pd.DataFrame
-    nicht_gefunden: pd.DataFrame
-    datei1_extrakt: pd.DataFrame
-    datei2_extrakt: pd.DataFrame
-    matrix: pd.DataFrame
-
-
-def normalisiere_sap_nummer(wert) -> str:
-    if pd.isna(wert):
+def normalize_sap(value) -> str:
+    if pd.isna(value):
         return ""
-
-    text = str(wert).strip()
+    text = str(value).strip()
     if text == "":
         return ""
-
     try:
-        zahl = float(text.replace(",", "."))
-        if zahl.is_integer():
-            return str(int(zahl))
+        number = float(text.replace(",", "."))
+        if number.is_integer():
+            return str(int(number))
     except Exception:
         pass
-
     return text
 
 
-def parse_sap_liste(text: str) -> List[str]:
-    if not text:
-        return []
-
-    teile = text.replace(",", " ").replace(";", " ").split()
-    ergebnis: List[str] = []
-    gesehen: Set[str] = set()
-
-    for teil in teile:
-        sap = normalisiere_sap_nummer(teil)
-        if sap and sap not in gesehen:
-            gesehen.add(sap)
-            ergebnis.append(sap)
-
-    return ergebnis
+def parse_sap_list(text: str) -> List[str]:
+    tokens = text.replace(",", " ").replace(";", " ").split()
+    result: List[str] = []
+    seen: Set[str] = set()
+    for token in tokens:
+        sap = normalize_sap(token)
+        if sap and sap not in seen:
+            seen.add(sap)
+            result.append(sap)
+    return result
 
 
-def ist_zahl_wert(wert) -> bool:
-    if pd.isna(wert):
+def is_numeric_cell(value) -> bool:
+    if pd.isna(value):
         return False
-
-    text = str(wert).strip()
+    text = str(value).strip()
     if text == "":
         return False
-
     try:
         float(text.replace(",", "."))
         return True
@@ -228,388 +207,207 @@ def ist_zahl_wert(wert) -> bool:
         return False
 
 
-def lief_tag_aus_wert(wert) -> int:
-    if not ist_zahl_wert(wert):
-        return 0
+def file1_days(uploaded_file, selected_saps: Set[str]) -> Tuple[Dict[str, Set[int]], pd.DataFrame, str]:
+    excel = pd.ExcelFile(uploaded_file)
+    sheet_name = excel.sheet_names[0]
+    df = pd.read_excel(excel, sheet_name=sheet_name, header=0)
 
-    try:
-        tag = int(float(str(wert).strip().replace(",", ".")))
-        if 1 <= tag <= 6:
-            return tag
-    except Exception:
-        pass
+    days_by_sap: Dict[str, Set[int]] = {}
+    rows: List[dict] = []
 
-    return 0
-
-
-def lese_datei_1(datei, startzeile: int, erlaubte_saps: Set[str]) -> Tuple[Dict[str, Set[int]], pd.DataFrame]:
-    arbeitsmappe = pd.ExcelFile(datei)
-    erstes_blatt = arbeitsmappe.sheet_names[0]
-    daten = pd.read_excel(arbeitsmappe, sheet_name=erstes_blatt, header=None)
-
-    lieferungen: Dict[str, Set[int]] = {}
-    extrakt_zeilen: List[dict] = []
-    gesehen: Set[Tuple[str, int]] = set()
-
-    for index in range(max(startzeile - 1, 0), len(daten)):
-        sap = normalisiere_sap_nummer(daten.iat[index, 0] if daten.shape[1] > 0 else None)
-        if not sap or (erlaubte_saps and sap not in erlaubte_saps):
+    for idx in range(len(df)):
+        sap = normalize_sap(df.iloc[idx, 0] if df.shape[1] > 0 else None)  # Spalte A
+        if selected_saps and sap not in selected_saps:
+            continue
+        if not sap:
             continue
 
-        tag = lief_tag_aus_wert(daten.iat[index, 6] if daten.shape[1] > 6 else None)
-        if tag == 0:
+        raw_day = df.iloc[idx, 6] if df.shape[1] > 6 else None  # Spalte G
+        if not is_numeric_cell(raw_day):
             continue
 
-        schluessel = (sap, tag)
-        if schluessel in gesehen:
+        day = int(float(str(raw_day).strip().replace(",", ".")))
+        if day < 1 or day > 6:
             continue
 
-        gesehen.add(schluessel)
-        lieferungen.setdefault(sap, set()).add(tag)
-        extrakt_zeilen.append(
+        days_by_sap.setdefault(sap, set()).add(day)
+        rows.append(
             {
-                "SAP-Nummer": sap,
-                "Liefertag Nummer": tag,
-                "Liefertag": DAY_NAMES[tag],
-                "Blatt": erstes_blatt,
-                "Zeile": index + 1,
-                "Fundstelle": f"{erstes_blatt} Zeile {index + 1}",
+                "SAP Nummer": sap,
+                "Liefertag Nummer": day,
+                "Liefertag": DAY_NAMES[day],
+                "Blatt": sheet_name,
+                "Zeile": idx + 2,
             }
         )
 
-    extrakt = pd.DataFrame(extrakt_zeilen)
-    if not extrakt.empty:
-        extrakt = extrakt.sort_values(["SAP-Nummer", "Liefertag Nummer"]).reset_index(drop=True)
+    extract = pd.DataFrame(rows).drop_duplicates()
+    if not extract.empty:
+        extract = extract.sort_values(["SAP Nummer", "Liefertag Nummer"]).reset_index(drop=True)
+    return days_by_sap, extract, sheet_name
 
-    return lieferungen, extrakt
 
+def file2_new_days(uploaded_file, selected_saps: Set[str], days_by_sap_file1: Dict[str, Set[int]]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    excel = pd.ExcelFile(uploaded_file)
+    sheet_names = excel.sheet_names[:4]
 
-def lese_datei_2(datei, startzeile: int, erlaubte_saps: Set[str], anzahl_blaetter: int) -> Tuple[Dict[str, Set[int]], pd.DataFrame]:
-    arbeitsmappe = pd.ExcelFile(datei)
-    blattnamen = arbeitsmappe.sheet_names[:anzahl_blaetter]
+    detail_rows: List[dict] = []
+    summary_map: Dict[str, Set[int]] = {}
 
-    lieferungen: Dict[str, Set[int]] = {}
-    extrakt_zeilen: List[dict] = []
-    gesehen: Set[Tuple[str, int]] = set()
+    for sheet_name in sheet_names:
+        df = pd.read_excel(excel, sheet_name=sheet_name, header=0)
 
-    for blattname in blattnamen:
-        daten = pd.read_excel(arbeitsmappe, sheet_name=blattname, header=None)
-
-        for index in range(max(startzeile - 1, 0), len(daten)):
-            sap = normalisiere_sap_nummer(daten.iat[index, 1] if daten.shape[1] > 1 else None)
-            if not sap or (erlaubte_saps and sap not in erlaubte_saps):
+        for idx in range(len(df)):
+            sap = normalize_sap(df.iloc[idx, 1] if df.shape[1] > 1 else None)  # Spalte B
+            if selected_saps and sap not in selected_saps:
+                continue
+            if not sap:
                 continue
 
-            for tag, spalten_index in DAY_COLUMNS_FILE2.items():
-                wert = daten.iat[index, spalten_index] if daten.shape[1] > spalten_index else None
-                if not ist_zahl_wert(wert):
+            existing_days = days_by_sap_file1.get(sap, set())
+
+            for day, col_idx in DAY_COLUMNS_FILE2.items():
+                if df.shape[1] <= col_idx:
                     continue
 
-                schluessel = (sap, tag)
-                if schluessel not in gesehen:
-                    gesehen.add(schluessel)
-                    lieferungen.setdefault(sap, set()).add(tag)
+                raw_value = df.iloc[idx, col_idx]
+                if not is_numeric_cell(raw_value):
+                    continue
 
-                extrakt_zeilen.append(
+                if day in existing_days:
+                    continue
+
+                detail_rows.append(
                     {
-                        "SAP-Nummer": sap,
-                        "Liefertag Nummer": tag,
-                        "Liefertag": DAY_NAMES[tag],
-                        "Blatt": blattname,
-                        "Zeile": index + 1,
-                        "Zellenwert": wert,
-                        "Fundstelle": f"{blattname} Zeile {index + 1}",
+                        "SAP Nummer": sap,
+                        "Liefertag Nummer": day,
+                        "Liefertag": DAY_NAMES[day],
+                        "Neu in Datei 2": "Ja",
+                        "Wert in Datei 2": raw_value,
+                        "Blatt Datei 2": sheet_name,
+                        "Zeile Datei 2": idx + 2,
+                        "Tage in Datei 1": ", ".join(
+                            f"{d} {DAY_NAMES[d]}" for d in sorted(existing_days)
+                        ),
                     }
                 )
+                summary_map.setdefault(sap, set()).add(day)
 
-    extrakt = pd.DataFrame(extrakt_zeilen)
-    if not extrakt.empty:
-        extrakt = extrakt.sort_values(["SAP-Nummer", "Liefertag Nummer", "Blatt", "Zeile"]).reset_index(drop=True)
+    details = pd.DataFrame(detail_rows)
+    if not details.empty:
+        details = details.drop_duplicates(subset=["SAP Nummer", "Liefertag Nummer", "Blatt Datei 2", "Zeile Datei 2"])
+        details = details.sort_values(["SAP Nummer", "Liefertag Nummer", "Blatt Datei 2", "Zeile Datei 2"]).reset_index(drop=True)
 
-    return lieferungen, extrakt
-
-
-def lief_tags_text(tags: Set[int]) -> str:
-    if not tags:
-        return ""
-    return ", ".join([f"{tag} {DAY_NAMES[tag]}" for tag in sorted(tags)])
-
-
-def fundstellen_map(extrakt: pd.DataFrame) -> Dict[Tuple[str, int], str]:
-    if extrakt.empty:
-        return {}
-
-    sammlung: Dict[Tuple[str, int], List[str]] = {}
-    for _, zeile in extrakt.iterrows():
-        schluessel = (str(zeile["SAP-Nummer"]), int(zeile["Liefertag Nummer"]))
-        sammlung.setdefault(schluessel, [])
-        fundstelle = str(zeile["Fundstelle"])
-        if fundstelle not in sammlung[schluessel]:
-            sammlung[schluessel].append(fundstelle)
-
-    return {schluessel: " | ".join(fundstellen) for schluessel, fundstellen in sammlung.items()}
-
-
-def baue_matrix(alle_saps: List[str], datei1_map: Dict[str, Set[int]], datei2_map: Dict[str, Set[int]]) -> pd.DataFrame:
-    zeilen: List[dict] = []
-    for sap in alle_saps:
-        zeile = {"SAP-Nummer": sap}
-        for tag in range(1, 7):
-            zeile[f"{DAY_NAMES[tag]} Datei 1"] = "Ja" if tag in datei1_map.get(sap, set()) else "Nein"
-            zeile[f"{DAY_NAMES[tag]} Datei 2"] = "Ja" if tag in datei2_map.get(sap, set()) else "Nein"
-        zeilen.append(zeile)
-
-    matrix = pd.DataFrame(zeilen)
-    return matrix
-
-
-def vergleiche_dateien(
-    datei1,
-    datei2,
-    sap_liste: List[str],
-    startzeile_datei1: int,
-    startzeile_datei2: int,
-    anzahl_blaetter_datei2: int,
-) -> CompareResult:
-    erlaubte_saps = set(sap_liste)
-
-    datei1_map, datei1_extrakt = lese_datei_1(datei1, startzeile_datei1, erlaubte_saps)
-    datei2_map, datei2_extrakt = lese_datei_2(datei2, startzeile_datei2, erlaubte_saps, anzahl_blaetter_datei2)
-
-    fundstellen_datei1 = fundstellen_map(datei1_extrakt)
-    fundstellen_datei2 = fundstellen_map(datei2_extrakt)
-
-    zusammenfassung_zeilen: List[dict] = []
-    tagesabweichung_zeilen: List[dict] = []
-    nicht_gefunden_zeilen: List[dict] = []
-
-    for sap in sap_liste:
-        tags1 = datei1_map.get(sap, set())
-        tags2 = datei2_map.get(sap, set())
-
-        hat1 = len(tags1) > 0
-        hat2 = len(tags2) > 0
-
-        if not hat1 and not hat2:
-            status = "In keiner Datei gefunden"
-            nicht_gefunden_zeilen.append({"SAP-Nummer": sap, "Hinweis": status})
-        elif tags1 != tags2:
-            if not hat1:
-                status = "Nur in Datei 2 vorhanden"
-            elif not hat2:
-                status = "Nur in Datei 1 vorhanden"
-            else:
-                status = "Liefertage unterschiedlich"
-        else:
-            status = "Gleich"
-
-        zusammenfassung_zeilen.append(
+    summary_rows: List[dict] = []
+    for sap, days in sorted(summary_map.items(), key=lambda item: item[0]):
+        summary_rows.append(
             {
-                "SAP-Nummer": sap,
-                "Liefertage Datei 1": lief_tags_text(tags1),
-                "Liefertage Datei 2": lief_tags_text(tags2),
-                "Status": status,
-                "Anzahl Liefertage Datei 1": len(tags1),
-                "Anzahl Liefertage Datei 2": len(tags2),
+                "SAP Nummer": sap,
+                "Neue Tage in Datei 2": ", ".join(f"{day} {DAY_NAMES[day]}" for day in sorted(days)),
+                "Anzahl neue Tage": len(days),
             }
         )
 
-        for tag in range(1, 7):
-            in_datei1 = tag in tags1
-            in_datei2 = tag in tags2
-            if in_datei1 == in_datei2:
-                continue
+    summary = pd.DataFrame(summary_rows)
+    return details, summary, sheet_names
 
-            if in_datei1 and not in_datei2:
-                detail_status = "Nur in Datei 1 vorhanden"
-            else:
-                detail_status = "Nur in Datei 2 vorhanden"
 
-            tagesabweichung_zeilen.append(
-                {
-                    "SAP-Nummer": sap,
-                    "Liefertag Nummer": tag,
-                    "Liefertag": DAY_NAMES[tag],
-                    "Status": detail_status,
-                    "Fundstelle Datei 1": fundstellen_datei1.get((sap, tag), ""),
-                    "Fundstelle Datei 2": fundstellen_datei2.get((sap, tag), ""),
-                }
-            )
+def build_excel(details: pd.DataFrame, summary: pd.DataFrame, extract_file1: pd.DataFrame, info: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary.to_excel(writer, index=False, sheet_name="Uebersicht")
+        details.to_excel(writer, index=False, sheet_name="Neu in Datei 2")
+        extract_file1.to_excel(writer, index=False, sheet_name="Datei 1 Extrakt")
+        info.to_excel(writer, index=False, sheet_name="Info")
+    return output.getvalue()
 
-    zusammenfassung = pd.DataFrame(zusammenfassung_zeilen)
-    if not zusammenfassung.empty:
-        status_reihenfolge = {
-            "Liefertage unterschiedlich": 1,
-            "Nur in Datei 1 vorhanden": 2,
-            "Nur in Datei 2 vorhanden": 3,
-            "In keiner Datei gefunden": 4,
-            "Gleich": 5,
-        }
-        zusammenfassung["_sort"] = zusammenfassung["Status"].map(status_reihenfolge)
-        zusammenfassung = zusammenfassung.sort_values(["_sort", "SAP-Nummer"]).drop(columns=["_sort"]).reset_index(drop=True)
 
-    tagesabweichungen = pd.DataFrame(tagesabweichung_zeilen)
-    if not tagesabweichungen.empty:
-        tagesabweichungen = tagesabweichungen.sort_values(["SAP-Nummer", "Liefertag Nummer"]).reset_index(drop=True)
-
-    nicht_gefunden = pd.DataFrame(nicht_gefunden_zeilen)
-    if not nicht_gefunden.empty:
-        nicht_gefunden = nicht_gefunden.sort_values(["SAP-Nummer"]).reset_index(drop=True)
-
-    matrix = baue_matrix(sap_liste, datei1_map, datei2_map)
-
-    return CompareResult(
-        zusammenfassung=zusammenfassung,
-        tagesabweichungen=tagesabweichungen,
-        nicht_gefunden=nicht_gefunden,
-        datei1_extrakt=datei1_extrakt,
-        datei2_extrakt=datei2_extrakt,
-        matrix=matrix,
+def make_info_df(
+    file1_name: str,
+    file2_name: str,
+    file1_sheet: str,
+    file2_sheets: List[str],
+    selected_count: int,
+    summary: pd.DataFrame,
+    details: pd.DataFrame,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"Feld": "Datei 1", "Wert": file1_name},
+            {"Feld": "Datei 1 Blatt", "Wert": file1_sheet},
+            {"Feld": "Datei 2", "Wert": file2_name},
+            {"Feld": "Geprüfte Blätter Datei 2", "Wert": ", ".join(file2_sheets)},
+            {"Feld": "Anzahl ausgewählte SAP Nummern", "Wert": selected_count},
+            {"Feld": "SAP Nummern mit neuen Tagen in Datei 2", "Wert": len(summary)},
+            {"Feld": "Anzahl Trefferzeilen", "Wert": len(details)},
+            {"Feld": "Logik", "Wert": "Es werden nur Tage ausgegeben, die in Datei 2 vorhanden sind und in Datei 1 nicht vorhanden sind."},
+        ]
     )
 
 
-def exportiere_bericht(result: CompareResult) -> bytes:
-    ausgabe = io.BytesIO()
-    with pd.ExcelWriter(ausgabe, engine="openpyxl") as writer:
-        result.zusammenfassung.to_excel(writer, index=False, sheet_name="Zusammenfassung")
-        result.tagesabweichungen.to_excel(writer, index=False, sheet_name="Tagesabweichungen")
-        result.nicht_gefunden.to_excel(writer, index=False, sheet_name="Nicht gefunden")
-        result.matrix.to_excel(writer, index=False, sheet_name="Matrix")
-        result.datei1_extrakt.to_excel(writer, index=False, sheet_name="Extrakt Datei 1")
-        result.datei2_extrakt.to_excel(writer, index=False, sheet_name="Extrakt Datei 2")
+st.set_page_config(page_title="Liefertage nur neu in Datei 2", layout="wide")
 
-        arbeitsmappe = writer.book
-        for blatt in arbeitsmappe.worksheets:
-            for spalte in blatt.columns:
-                max_laenge = 0
-                spaltenbuchstabe = spalte[0].column_letter
-                for zelle in spalte:
-                    try:
-                        inhalt = "" if zelle.value is None else str(zelle.value)
-                    except Exception:
-                        inhalt = ""
-                    max_laenge = max(max_laenge, len(inhalt))
-                blatt.column_dimensions[spaltenbuchstabe].width = min(max(max_laenge + 2, 12), 42)
-            blatt.freeze_panes = "A2"
+st.title("Liefertage: nur neue Tage aus Datei 2")
+st.write(
+    "Diese App erzeugt nur eine Excel-Datei. "
+    "Geprüft wird ausschließlich, ob in Datei 2 Liefertage vorhanden sind, die in Datei 1 nicht vorhanden sind."
+)
 
-    ausgabe.seek(0)
-    return ausgabe.getvalue()
-
-
-def zeige_kennzahlen(result: CompareResult, anzahl_saps: int):
-    anzahl_gleich = int((result.zusammenfassung["Status"] == "Gleich").sum()) if not result.zusammenfassung.empty else 0
-    anzahl_abweichend = int((result.zusammenfassung["Status"] != "Gleich").sum()) if not result.zusammenfassung.empty else 0
-    anzahl_nicht_gefunden = len(result.nicht_gefunden)
-    anzahl_tagesabweichungen = len(result.tagesabweichungen)
-
-    spalte1, spalte2, spalte3, spalte4 = st.columns(4)
-    spalte1.metric("Ausgewählte Kunden", anzahl_saps)
-    spalte2.metric("Kunden ohne Abweichung", anzahl_gleich)
-    spalte3.metric("Kunden mit Abweichung", anzahl_abweichend)
-    spalte4.metric("Tagesabweichungen", anzahl_tagesabweichungen)
-
-    st.caption(f"Nicht gefundene Kunden: {anzahl_nicht_gefunden}")
-
-
-def hauptseite():
-    st.set_page_config(page_title="Liefertage Vergleich", layout="wide")
-    st.title("Liefertage Vergleich als Streamlit Auswertung")
-    st.write(
-        "Lade zwei Excel-Dateien hoch. Die Anwendung liest aus Datei 1 die SAP-Nummer aus Spalte A "
-        "und den Liefertag aus Spalte G. Aus Datei 2 werden die ersten Blätter gelesen, dort ist die "
-        "SAP-Nummer in Spalte B und Montag bis Samstag stehen in Spalte G bis L."
-    )
-
-    with st.sidebar:
-        st.header("Einstellungen")
-        startzeile_datei1 = st.number_input("Startzeile Datei 1", min_value=1, value=2, step=1)
-        startzeile_datei2 = st.number_input("Startzeile Datei 2", min_value=1, value=2, step=1)
-        anzahl_blaetter = st.number_input("Anzahl Blätter in Datei 2", min_value=1, max_value=20, value=4, step=1)
-        nur_abweichungen = st.checkbox("In Tabellen zuerst nur Abweichungen zeigen", value=True)
-
-    spalte_links, spalte_rechts = st.columns(2)
-    with spalte_links:
-        datei1 = st.file_uploader("Datei 1 hochladen", type=["xlsx", "xlsm", "xls"])
-    with spalte_rechts:
-        datei2 = st.file_uploader("Datei 2 hochladen", type=["xlsx", "xlsm", "xls"])
-
+with st.expander("SAP Nummern", expanded=False):
     sap_text = st.text_area(
-        "Zu vergleichende SAP-Nummern",
+        "Nur diese SAP Nummern vergleichen",
         value=DEFAULT_SAP_TEXT,
-        height=260,
-        help="Eine SAP-Nummer pro Zeile oder mit Leerzeichen getrennt einfügen.",
+        height=320,
     )
 
-    sap_liste = parse_sap_liste(sap_text)
-    st.info(f"Es werden aktuell {len(sap_liste)} SAP-Nummern verglichen.")
+file1 = st.file_uploader(
+    "Datei 1 hochladen – erstes Blatt, Spalte A = SAP Nummer, Spalte G = Liefertag 1 bis 6",
+    type=["xlsx", "xlsm", "xls"],
+    key="file1",
+)
 
-    if not datei1 or not datei2:
-        st.warning("Bitte beide Excel-Dateien hochladen.")
-        return
+file2 = st.file_uploader(
+    "Datei 2 hochladen – erste vier Blätter, Spalte B = SAP Nummer, Spalte G bis L = Montag bis Samstag",
+    type=["xlsx", "xlsm", "xls"],
+    key="file2",
+)
 
-    if not sap_liste:
-        st.error("Bitte mindestens eine SAP-Nummer eintragen.")
-        return
+if st.button("Excel erzeugen", type="primary"):
+    selected_list = parse_sap_list(sap_text)
+    selected_set = set(selected_list)
 
-    with st.spinner("Dateien werden gelesen und verglichen..."):
-        result = vergleiche_dateien(
-            datei1=datei1,
-            datei2=datei2,
-            sap_liste=sap_liste,
-            startzeile_datei1=int(startzeile_datei1),
-            startzeile_datei2=int(startzeile_datei2),
-            anzahl_blaetter_datei2=int(anzahl_blaetter),
+    if not file1 or not file2:
+        st.error("Bitte beide Excel-Dateien hochladen.")
+        st.stop()
+
+    if not selected_list:
+        st.error("Bitte mindestens eine SAP Nummer eingeben.")
+        st.stop()
+
+    try:
+        days_file1, extract_file1, file1_sheet = file1_days(file1, selected_set)
+        details, summary, file2_sheets = file2_new_days(file2, selected_set, days_file1)
+
+        info = make_info_df(
+            file1_name=file1.name,
+            file2_name=file2.name,
+            file1_sheet=file1_sheet,
+            file2_sheets=file2_sheets,
+            selected_count=len(selected_list),
+            summary=summary,
+            details=details,
         )
 
-    zeige_kennzahlen(result, len(sap_liste))
+        excel_bytes = build_excel(details, summary, extract_file1, info)
 
-    tabs = st.tabs([
-        "Zusammenfassung",
-        "Tagesabweichungen",
-        "Nicht gefunden",
-        "Matrix",
-        "Extrakt Datei 1",
-        "Extrakt Datei 2",
-    ])
-
-    with tabs[0]:
-        daten = result.zusammenfassung.copy()
-        if nur_abweichungen:
-            daten = daten[daten["Status"] != "Gleich"].reset_index(drop=True)
-        st.dataframe(daten, use_container_width=True, hide_index=True)
-
-        if not result.zusammenfassung.empty:
-            status_werte = result.zusammenfassung["Status"].value_counts().rename_axis("Status").reset_index(name="Anzahl")
-            st.subheader("Verteilung nach Status")
-            st.bar_chart(status_werte.set_index("Status"))
-
-    with tabs[1]:
-        st.dataframe(result.tagesabweichungen, use_container_width=True, hide_index=True)
-        if not result.tagesabweichungen.empty:
-            tage_werte = result.tagesabweichungen["Liefertag"].value_counts().reindex(list(DAY_NAMES.values()), fill_value=0)
-            st.subheader("Abweichungen pro Liefertag")
-            st.bar_chart(tage_werte)
-
-    with tabs[2]:
-        st.dataframe(result.nicht_gefunden, use_container_width=True, hide_index=True)
-
-    with tabs[3]:
-        st.dataframe(result.matrix, use_container_width=True, hide_index=True)
-
-    with tabs[4]:
-        st.dataframe(result.datei1_extrakt, use_container_width=True, hide_index=True)
-
-    with tabs[5]:
-        st.dataframe(result.datei2_extrakt, use_container_width=True, hide_index=True)
-
-    excel_bytes = exportiere_bericht(result)
-    st.download_button(
-        label="Bericht als Excel herunterladen",
-        data=excel_bytes,
-        file_name="liefertage_vergleich_auswertung.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-if __name__ == "__main__":
-    hauptseite()
+        st.success(
+            f"Fertig. Gefunden wurden {len(details)} Zeilen mit Tagen, die nur in Datei 2 vorhanden sind."
+        )
+        st.download_button(
+            label="Excel herunterladen",
+            data=excel_bytes,
+            file_name="liefertage_nur_neu_in_datei2.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as exc:
+        st.error(f"Fehler beim Verarbeiten der Dateien: {exc}")
