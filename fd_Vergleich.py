@@ -182,7 +182,8 @@ def build_missing_in_sap(
     tour_df: pd.DataFrame,
     days_by_sap: Dict[str, Set[int]],
 ) -> pd.DataFrame:
-    """Tage, die in der Tourenplanung stehen, aber in SAP nicht als Liefertag hinterlegt sind."""
+    """Eine Zeile pro Kunde: welche Tage stehen in der Tourenplanung, fehlen aber
+    in SAP als Liefertag."""
     if tour_df.empty:
         return _empty_result_df()
 
@@ -190,108 +191,107 @@ def build_missing_in_sap(
     if known.empty:
         return _empty_result_df()
 
-    def is_missing(row) -> bool:
-        return row["tag_num"] not in days_by_sap.get(row["sap"], set())
-
-    known["fehlt"] = known.apply(is_missing, axis=1)
-    missing = known[known["fehlt"]].copy()
+    known["fehlt"] = known.apply(
+        lambda row: row["tag_num"] not in days_by_sap.get(row["sap"], set()),
+        axis=1,
+    )
+    missing = known[known["fehlt"]]
     if missing.empty:
         return _empty_result_df()
 
-    missing["Standort"] = missing["sap"].map(CUSTOMER_TO_LOCATION).fillna("Ohne Zuordnung")
-    missing["Fehlender Liefertag"] = missing["tag_num"].map(DAY_NAMES)
-    missing["Liefertage in SAP"] = missing["sap"].map(
+    agg = missing.groupby("sap", as_index=False).agg(
+        tage=("tag_num", lambda x: sorted(set(x))),
+        blaetter=("blatt", lambda x: sorted(set(x))),
+    )
+
+    agg["Standort"] = agg["sap"].map(CUSTOMER_TO_LOCATION).fillna("Ohne Zuordnung")
+    agg["Fehlende Liefertage"] = agg["tage"].map(
+        lambda tage: ", ".join(f"{d} {DAY_NAMES[d]}" for d in tage)
+    )
+    agg["Anzahl fehlender Tage"] = agg["tage"].map(len)
+    agg["Blätter Tourenplanung"] = agg["blaetter"].map(", ".join)
+    agg["Liefertage in SAP"] = agg["sap"].map(
         lambda s: ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(days_by_sap.get(s, set())))
+        or "(keine hinterlegt)"
     )
-    missing["_StandortSort"] = missing["Standort"].map(LOCATION_ORDER).fillna(999)
-    missing["_KundenSort"] = missing["sap"].map(CUSTOMER_TO_ORDER).fillna(999999)
+    agg["Hinweis"] = "Tage in Tourenplanung vorhanden, aber in SAP nicht als Liefertag hinterlegt"
 
-    result = missing.rename(
-        columns={
-            "sap": "SAP Nummer",
-            "tag_num": "Fehlender Liefertag Nummer",
-            "blatt": "Blatt Tourenplanung",
-            "wert": "Wert in Tourenplanung",
-        }
-    )
-    result["Hinweis"] = "Tag in Tourenplanung vorhanden, aber in SAP nicht als Liefertag hinterlegt"
-
-    result = result.drop_duplicates(
-        subset=["SAP Nummer", "Fehlender Liefertag Nummer", "Blatt Tourenplanung"]
-    )
-    result = result.sort_values(
-        ["_StandortSort", "_KundenSort", "SAP Nummer", "Fehlender Liefertag Nummer", "Blatt Tourenplanung"]
+    agg["_StandortSort"] = agg["Standort"].map(LOCATION_ORDER).fillna(999)
+    agg["_KundenSort"] = agg["sap"].map(CUSTOMER_TO_ORDER).fillna(999999)
+    agg = agg.rename(columns={"sap": "SAP Nummer"}).sort_values(
+        ["_StandortSort", "_KundenSort"]
     ).reset_index(drop=True)
 
-    return result[_export_columns_missing()]
+    return agg[_export_columns_missing()]
 
 
 def build_missing_in_tour(
     tour_df: pd.DataFrame,
     days_by_sap: Dict[str, Set[int]],
 ) -> pd.DataFrame:
-    """Tage, die in SAP als Liefertag stehen, aber in der Tourenplanung fehlen."""
-    # Alle Tage pro SAP, die in der Tourenplanung vorkommen (über alle Blätter)
+    """Eine Zeile pro Kunde: welche Tage sind in SAP als Liefertag hinterlegt,
+    fehlen aber in der Tourenplanung."""
     days_in_tour: Dict[str, Set[int]] = {}
     if not tour_df.empty:
-        grouped = tour_df.groupby("sap")["tag_num"].agg(set).to_dict()
-        days_in_tour = {k: v for k, v in grouped.items()}
+        days_in_tour = tour_df.groupby("sap")["tag_num"].agg(set).to_dict()
 
     rows: List[dict] = []
     for sap, sap_days in days_by_sap.items():
         tour_days = days_in_tour.get(sap, set())
         fehlend = sorted(sap_days - tour_days)
-        for day in fehlend:
-            standort = CUSTOMER_TO_LOCATION.get(sap, "Ohne Zuordnung")
-            rows.append({
-                "Standort": standort,
-                "SAP Nummer": sap,
-                "Fehlender Liefertag Nummer": day,
-                "Fehlender Liefertag": DAY_NAMES[day],
-                "Liefertage in Tourenplanung": ", ".join(
-                    f"{d} {DAY_NAMES[d]}" for d in sorted(tour_days)
-                ) or "(nicht in Tourenplanung vorhanden)",
-                "Hinweis": "Tag ist in SAP als Liefertag hinterlegt, kommt aber in der Tourenplanung nicht vor",
-                "_StandortSort": LOCATION_ORDER.get(standort, 999),
-                "_KundenSort": CUSTOMER_TO_ORDER.get(sap, 999999),
-            })
+        if not fehlend:
+            continue
+        standort = CUSTOMER_TO_LOCATION.get(sap, "Ohne Zuordnung")
+        rows.append({
+            "Standort": standort,
+            "SAP Nummer": sap,
+            "Fehlende Liefertage": ", ".join(f"{d} {DAY_NAMES[d]}" for d in fehlend),
+            "Anzahl fehlender Tage": len(fehlend),
+            "Liefertage in Tourenplanung": ", ".join(
+                f"{d} {DAY_NAMES[d]}" for d in sorted(tour_days)
+            ) or "(nicht in Tourenplanung vorhanden)",
+            "Hinweis": "Tage in SAP als Liefertag hinterlegt, kommen aber in der Tourenplanung nicht vor",
+            "_StandortSort": LOCATION_ORDER.get(standort, 999),
+            "_KundenSort": CUSTOMER_TO_ORDER.get(sap, 999999),
+        })
 
     if not rows:
         return pd.DataFrame(columns=_export_columns_missing_tour())
 
     df = pd.DataFrame(rows)
-    df = df.sort_values(
-        ["_StandortSort", "_KundenSort", "SAP Nummer", "Fehlender Liefertag Nummer"]
-    ).reset_index(drop=True)
+    df = df.sort_values(["_StandortSort", "_KundenSort"]).reset_index(drop=True)
     return df[_export_columns_missing_tour()]
 
 
 def build_unknown_saps(tour_df: pd.DataFrame) -> pd.DataFrame:
-    """SAP-Nummern in der Tourenplanung, die in keiner Kundengruppe hinterlegt sind."""
+    """Eine Zeile pro unbekanntem Kunden: SAP-Nummern in der Tourenplanung,
+    die in keiner Kundengruppe hinterlegt sind."""
+    empty_cols = ["SAP Nummer", "Blätter Tourenplanung", "Gesamt-Vorkommen"]
     if tour_df.empty:
-        return pd.DataFrame(columns=["SAP Nummer", "Blatt Tourenplanung", "Vorkommen"])
+        return pd.DataFrame(columns=empty_cols)
 
-    unknown = tour_df[~tour_df["sap"].isin(SELECTED_SAPS) & tour_df["sap"].ne("")].copy()
+    unknown = tour_df[~tour_df["sap"].isin(SELECTED_SAPS) & tour_df["sap"].ne("")]
     if unknown.empty:
-        return pd.DataFrame(columns=["SAP Nummer", "Blatt Tourenplanung", "Vorkommen"])
+        return pd.DataFrame(columns=empty_cols)
 
-    agg = (
-        unknown.groupby(["sap", "blatt"])
-        .size()
-        .reset_index(name="Vorkommen")
-        .rename(columns={"sap": "SAP Nummer", "blatt": "Blatt Tourenplanung"})
+    agg = unknown.groupby("sap", as_index=False).agg(
+        blaetter=("blatt", lambda x: sorted(set(x))),
+        gesamt=("blatt", "size"),
     )
-    return agg.sort_values(["SAP Nummer", "Blatt Tourenplanung"]).reset_index(drop=True)
+    agg["SAP Nummer"] = agg["sap"]
+    agg["Blätter Tourenplanung"] = agg["blaetter"].map(", ".join)
+    agg["Gesamt-Vorkommen"] = agg["gesamt"]
+    agg = agg.sort_values("SAP Nummer").reset_index(drop=True)
+    return agg[empty_cols]
 
 
 def _export_columns_missing() -> List[str]:
     return [
         "Standort",
         "SAP Nummer",
-        "Fehlender Liefertag Nummer",
-        "Fehlender Liefertag",
-        "Blatt Tourenplanung",
-        "Wert in Tourenplanung",
+        "Fehlende Liefertage",
+        "Anzahl fehlender Tage",
+        "Blätter Tourenplanung",
         "Liefertage in SAP",
         "Hinweis",
     ]
@@ -301,8 +301,8 @@ def _export_columns_missing_tour() -> List[str]:
     return [
         "Standort",
         "SAP Nummer",
-        "Fehlender Liefertag Nummer",
-        "Fehlender Liefertag",
+        "Fehlende Liefertage",
+        "Anzahl fehlender Tage",
         "Liefertage in Tourenplanung",
         "Hinweis",
     ]
@@ -312,24 +312,41 @@ def _empty_result_df() -> pd.DataFrame:
     return pd.DataFrame(columns=_export_columns_missing())
 
 
+def interleave_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Fügt nach jeder Datenzeile außer der letzten eine komplett leere Zeile ein."""
+    if df.empty or len(df) <= 1:
+        return df.reset_index(drop=True)
+    blank = pd.DataFrame([[pd.NA] * len(df.columns)], columns=df.columns)
+    pieces: List[pd.DataFrame] = []
+    for i in range(len(df)):
+        pieces.append(df.iloc[[i]])
+        if i < len(df) - 1:
+            pieces.append(blank)
+    return pd.concat(pieces, ignore_index=True)
+
+
 def build_excel(
     missing_sap: pd.DataFrame,
     missing_tour: pd.DataFrame | None,
     unknown_saps: pd.DataFrame | None,
 ) -> bytes:
-    """Schreibt eine formatierte Excel-Datei mit bis zu drei Blättern."""
+    """Schreibt eine formatierte Excel-Datei mit bis zu drei Blättern.
+    Zwischen jedem Kunden wird eine Leerzeile eingefügt."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        missing_sap.to_excel(writer, index=False, sheet_name="Fehlt in SAP")
-        _format_sheet(writer, "Fehlt in SAP", missing_sap)
+        missing_sap_out = interleave_blank_rows(missing_sap)
+        missing_sap_out.to_excel(writer, index=False, sheet_name="Fehlt in SAP", na_rep="")
+        _format_sheet(writer, "Fehlt in SAP", missing_sap_out)
 
         if missing_tour is not None:
-            missing_tour.to_excel(writer, index=False, sheet_name="Fehlt in Tourenplanung")
-            _format_sheet(writer, "Fehlt in Tourenplanung", missing_tour)
+            missing_tour_out = interleave_blank_rows(missing_tour)
+            missing_tour_out.to_excel(writer, index=False, sheet_name="Fehlt in Tourenplanung", na_rep="")
+            _format_sheet(writer, "Fehlt in Tourenplanung", missing_tour_out)
 
         if unknown_saps is not None and not unknown_saps.empty:
-            unknown_saps.to_excel(writer, index=False, sheet_name="Unbekannte SAP-Nummern")
-            _format_sheet(writer, "Unbekannte SAP-Nummern", unknown_saps)
+            unknown_out = interleave_blank_rows(unknown_saps)
+            unknown_out.to_excel(writer, index=False, sheet_name="Unbekannte SAP-Nummern", na_rep="")
+            _format_sheet(writer, "Unbekannte SAP-Nummern", unknown_out)
 
     return output.getvalue()
 
@@ -474,7 +491,8 @@ if result:
     unknown_saps = result["unknown_saps"]
 
     st.success(
-        f"Fertig. {len(missing_sap)} Zeilen in Tourenplanung, die in SAP als Liefertag fehlen."
+        f"Fertig. {len(missing_sap)} Kunden mit Tagen in der Tourenplanung, "
+        f"die in SAP als Liefertag fehlen."
     )
 
     st.caption(
@@ -484,7 +502,13 @@ if result:
 
     if not missing_sap.empty:
         standort_zaehlung = (
-            missing_sap.groupby("Standort").size().reset_index(name="Anzahl fehlender Tage")
+            missing_sap.groupby("Standort", as_index=False)
+            .agg(
+                **{
+                    "Betroffene Kunden": ("SAP Nummer", "count"),
+                    "Fehlende Tage gesamt": ("Anzahl fehlender Tage", "sum"),
+                }
+            )
         )
         st.dataframe(standort_zaehlung, use_container_width=True, hide_index=True)
 
@@ -495,11 +519,11 @@ if result:
             st.dataframe(vorschau, use_container_width=True, hide_index=True)
 
     if missing_tour is not None and not missing_tour.empty:
-        with st.expander(f"Vorschau: Fehlt in Tourenplanung ({len(missing_tour)} Zeilen)", expanded=False):
+        with st.expander(f"Vorschau: Fehlt in Tourenplanung ({len(missing_tour)} Kunden)", expanded=False):
             st.dataframe(missing_tour, use_container_width=True, hide_index=True)
 
     if unknown_saps is not None and not unknown_saps.empty:
-        with st.expander(f"Vorschau: Unbekannte SAP-Nummern ({len(unknown_saps)} Zeilen)", expanded=False):
+        with st.expander(f"Vorschau: Unbekannte SAP-Nummern ({len(unknown_saps)} Kunden)", expanded=False):
             st.dataframe(unknown_saps, use_container_width=True, hide_index=True)
 
     st.download_button(
