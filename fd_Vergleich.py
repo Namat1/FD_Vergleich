@@ -220,9 +220,9 @@ def build_missing_in_sap(
     )
 
     agg["_StandortSort"] = agg["Standort"].map(LOCATION_ORDER).fillna(999)
-    agg["_KundenSort"] = agg["sap"].map(CUSTOMER_TO_ORDER).fillna(999999)
+    agg["_SapSort"] = pd.to_numeric(agg["sap"], errors="coerce").fillna(9_999_999_999)
     agg = agg.rename(columns={"sap": "SAP Nummer"}).sort_values(
-        ["_StandortSort", "_KundenSort"]
+        ["_StandortSort", "_SapSort"]
     ).reset_index(drop=True)
 
     return agg[_export_columns_missing()]
@@ -256,14 +256,14 @@ def build_missing_in_tour(
                 f"{d} {DAY_NAMES[d]}" for d in sorted(tour_days)
             ) or "(nicht in Tourenplanung vorhanden)",
             "_StandortSort": LOCATION_ORDER.get(standort, 999),
-            "_KundenSort": CUSTOMER_TO_ORDER.get(sap, 999999),
+            "_SapSort": int(sap) if sap.isdigit() else 9_999_999_999,
         })
 
     if not rows:
         return pd.DataFrame(columns=_export_columns_missing_tour())
 
     df = pd.DataFrame(rows)
-    df = df.sort_values(["_StandortSort", "_KundenSort"]).reset_index(drop=True)
+    df = df.sort_values(["_StandortSort", "_SapSort"]).reset_index(drop=True)
     return df[_export_columns_missing_tour()]
 
 
