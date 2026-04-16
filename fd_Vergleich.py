@@ -205,15 +205,12 @@ def build_missing_in_sap(
 
     agg = missing.groupby("sap", as_index=False).agg(
         tage=("tag_num", lambda x: sorted(set(x))),
-        blaetter=("blatt", lambda x: sorted(set(x))),
     )
 
     agg["Standort"] = agg["sap"].map(CUSTOMER_TO_LOCATION).fillna("Ohne Zuordnung")
     agg["Fehlende LT"] = agg["tage"].map(
         lambda tage: ", ".join(f"{d} {DAY_NAMES[d]}" for d in tage)
     )
-    agg["Anzahl fehlender Tage"] = agg["tage"].map(len)
-    agg["Blätter Tourenplanung"] = agg["blaetter"].map(", ".join)
     agg["LT SAP"] = agg["sap"].map(
         lambda s: ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(days_by_sap.get(s, set())))
         or "(keine hinterlegt)"
@@ -252,7 +249,6 @@ def build_missing_in_tour(
             "Standort": standort,
             "SAP Nummer": sap,
             "Fehlende LT": ", ".join(f"{d} {DAY_NAMES[d]}" for d in fehlend),
-            "Anzahl fehlender Tage": len(fehlend),
             "LT SAP": ", ".join(
                 f"{d} {DAY_NAMES[d]}" for d in sorted(sap_days)
             ),
@@ -298,8 +294,6 @@ def _export_columns_missing() -> List[str]:
         "Standort",
         "SAP Nummer",
         "Fehlende LT",
-        "Anzahl fehlender Tage",
-        "Blätter Tourenplanung",
         "LT SAP",
         "LT Tourenplanung",
     ]
@@ -310,7 +304,6 @@ def _export_columns_missing_tour() -> List[str]:
         "Standort",
         "SAP Nummer",
         "Fehlende LT",
-        "Anzahl fehlender Tage",
         "LT SAP",
         "LT Tourenplanung",
     ]
@@ -511,13 +504,8 @@ if result:
     if not missing_sap.empty:
         standort_zaehlung = (
             missing_sap.groupby("Standort", as_index=False)
-            .agg({"SAP Nummer": "count", "Anzahl fehlender Tage": "sum"})
-            .rename(
-                columns={
-                    "SAP Nummer": "Betroffene Kunden",
-                    "Anzahl fehlender Tage": "Fehlende Tage gesamt",
-                }
-            )
+            .agg({"SAP Nummer": "count"})
+            .rename(columns={"SAP Nummer": "Betroffene Kunden"})
         )
         st.dataframe(standort_zaehlung, use_container_width=True, hide_index=True)
 
