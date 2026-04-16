@@ -199,22 +199,28 @@ def build_missing_in_sap(
     if missing.empty:
         return _empty_result_df()
 
+    days_in_tour: Dict[str, Set[int]] = (
+        tour_df.groupby("sap")["tag_num"].agg(set).to_dict()
+    )
+
     agg = missing.groupby("sap", as_index=False).agg(
         tage=("tag_num", lambda x: sorted(set(x))),
         blaetter=("blatt", lambda x: sorted(set(x))),
     )
 
     agg["Standort"] = agg["sap"].map(CUSTOMER_TO_LOCATION).fillna("Ohne Zuordnung")
-    agg["Fehlende Liefertage"] = agg["tage"].map(
+    agg["Fehlende LT"] = agg["tage"].map(
         lambda tage: ", ".join(f"{d} {DAY_NAMES[d]}" for d in tage)
     )
     agg["Anzahl fehlender Tage"] = agg["tage"].map(len)
     agg["Blätter Tourenplanung"] = agg["blaetter"].map(", ".join)
-    agg["Liefertage in SAP"] = agg["sap"].map(
+    agg["LT SAP"] = agg["sap"].map(
         lambda s: ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(days_by_sap.get(s, set())))
         or "(keine hinterlegt)"
     )
-    agg["Hinweis"] = "Tage in Tourenplanung vorhanden, aber in SAP nicht als Liefertag hinterlegt"
+    agg["LT Tourenplanung"] = agg["sap"].map(
+        lambda s: ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(days_in_tour.get(s, set())))
+    )
 
     agg["_StandortSort"] = agg["Standort"].map(LOCATION_ORDER).fillna(999)
     agg["_KundenSort"] = agg["sap"].map(CUSTOMER_TO_ORDER).fillna(999999)
@@ -245,12 +251,14 @@ def build_missing_in_tour(
         rows.append({
             "Standort": standort,
             "SAP Nummer": sap,
-            "Fehlende Liefertage": ", ".join(f"{d} {DAY_NAMES[d]}" for d in fehlend),
+            "Fehlende LT": ", ".join(f"{d} {DAY_NAMES[d]}" for d in fehlend),
             "Anzahl fehlender Tage": len(fehlend),
-            "Liefertage in Tourenplanung": ", ".join(
+            "LT SAP": ", ".join(
+                f"{d} {DAY_NAMES[d]}" for d in sorted(sap_days)
+            ),
+            "LT Tourenplanung": ", ".join(
                 f"{d} {DAY_NAMES[d]}" for d in sorted(tour_days)
             ) or "(nicht in Tourenplanung vorhanden)",
-            "Hinweis": "Tage in SAP als Liefertag hinterlegt, kommen aber in der Tourenplanung nicht vor",
             "_StandortSort": LOCATION_ORDER.get(standort, 999),
             "_KundenSort": CUSTOMER_TO_ORDER.get(sap, 999999),
         })
@@ -289,11 +297,11 @@ def _export_columns_missing() -> List[str]:
     return [
         "Standort",
         "SAP Nummer",
-        "Fehlende Liefertage",
+        "Fehlende LT",
         "Anzahl fehlender Tage",
         "Blätter Tourenplanung",
-        "Liefertage in SAP",
-        "Hinweis",
+        "LT SAP",
+        "LT Tourenplanung",
     ]
 
 
@@ -301,10 +309,10 @@ def _export_columns_missing_tour() -> List[str]:
     return [
         "Standort",
         "SAP Nummer",
-        "Fehlende Liefertage",
+        "Fehlende LT",
         "Anzahl fehlender Tage",
-        "Liefertage in Tourenplanung",
-        "Hinweis",
+        "LT SAP",
+        "LT Tourenplanung",
     ]
 
 
