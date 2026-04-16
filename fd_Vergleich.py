@@ -156,8 +156,7 @@ DAY_NAMES = {
     6: "Samstag",
 }
 
-# pandas benutzt nullbasierte Spaltenindizes
-DAY_COLUMNS_FILE2 = {
+DAY_COLUMNS_PLANUNG = {
     1: 6,   # G
     2: 7,   # H
     3: 8,   # I
@@ -207,19 +206,16 @@ def is_numeric_cell(value) -> bool:
         return False
 
 
-def file1_days(uploaded_file, selected_saps: Set[str]) -> Tuple[Dict[str, Set[int]], pd.DataFrame, str]:
+def read_liefertag_datei(uploaded_file, selected_saps: Set[str]) -> Tuple[Dict[str, Set[int]], str]:
     excel = pd.ExcelFile(uploaded_file)
     sheet_name = excel.sheet_names[0]
     df = pd.read_excel(excel, sheet_name=sheet_name, header=0)
 
     days_by_sap: Dict[str, Set[int]] = {}
-    rows: List[dict] = []
 
     for idx in range(len(df)):
         sap = normalize_sap(df.iloc[idx, 0] if df.shape[1] > 0 else None)  # Spalte A
-        if selected_saps and sap not in selected_saps:
-            continue
-        if not sap:
+        if not sap or (selected_saps and sap not in selected_saps):
             continue
 
         raw_day = df.iloc[idx, 6] if df.shape[1] > 6 else None  # Spalte G
@@ -227,46 +223,33 @@ def file1_days(uploaded_file, selected_saps: Set[str]) -> Tuple[Dict[str, Set[in
             continue
 
         day = int(float(str(raw_day).strip().replace(",", ".")))
-        if day < 1 or day > 6:
-            continue
+        if 1 <= day <= 6:
+            days_by_sap.setdefault(sap, set()).add(day)
 
-        days_by_sap.setdefault(sap, set()).add(day)
-        rows.append(
-            {
-                "SAP Nummer": sap,
-                "Liefertag Nummer": day,
-                "Liefertag": DAY_NAMES[day],
-                "Blatt": sheet_name,
-                "Zeile": idx + 2,
-            }
-        )
-
-    extract = pd.DataFrame(rows).drop_duplicates()
-    if not extract.empty:
-        extract = extract.sort_values(["SAP Nummer", "Liefertag Nummer"]).reset_index(drop=True)
-    return days_by_sap, extract, sheet_name
+    return days_by_sap, sheet_name
 
 
-def file2_new_days(uploaded_file, selected_saps: Set[str], days_by_sap_file1: Dict[str, Set[int]]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+def compare_planung_against_liefertage(
+    uploaded_file,
+    selected_saps: Set[str],
+    days_in_liefertag_datei: Dict[str, Set[int]],
+) -> Tuple[pd.DataFrame, List[str]]:
     excel = pd.ExcelFile(uploaded_file)
     sheet_names = excel.sheet_names[:4]
 
-    detail_rows: List[dict] = []
-    summary_map: Dict[str, Set[int]] = {}
+    result_rows: List[dict] = []
 
     for sheet_name in sheet_names:
         df = pd.read_excel(excel, sheet_name=sheet_name, header=0)
 
         for idx in range(len(df)):
             sap = normalize_sap(df.iloc[idx, 1] if df.shape[1] > 1 else None)  # Spalte B
-            if selected_saps and sap not in selected_saps:
-                continue
-            if not sap:
+            if not sap or (selected_saps and sap not in selected_saps):
                 continue
 
-            existing_days = days_by_sap_file1.get(sap, set())
+            vorhandene_tage = days_in_liefertag_datei.get(sap, set())
 
-            for day, col_idx in DAY_COLUMNS_FILE2.items():
+            for day, col_idx in DAY_COLUMNS_PLANUNG.items():
                 if df.shape[1] <= col_idx:
                     continue
 
@@ -274,83 +257,57 @@ def file2_new_days(uploaded_file, selected_saps: Set[str], days_by_sap_file1: Di
                 if not is_numeric_cell(raw_value):
                     continue
 
-                if day in existing_days:
+                if day in vorhandene_tage:
                     continue
 
-                detail_rows.append(
+                result_rows.append(
                     {
                         "SAP Nummer": sap,
-                        "Liefertag Nummer": day,
-                        "Liefertag": DAY_NAMES[day],
-                        "Neu in Datei 2": "Ja",
-                        "Wert in Datei 2": raw_value,
-                        "Blatt Datei 2": sheet_name,
-                        "Zeile Datei 2": idx + 2,
-                        "Tage in Datei 1": ", ".join(
-                            f"{d} {DAY_NAMES[d]}" for d in sorted(existing_days)
+                        "Fehlender Liefertag Nummer": day,
+                        "Fehlender Liefertag": DAY_NAMES[day],
+                        "Blatt Planung": sheet_name,
+                        "Zeile Planung": idx + 2,
+                        "Wert in Planung": raw_value,
+                        "Liefertage in anderer Datei": ", ".join(
+                            f"{d} {DAY_NAMES[d]}" for d in sorted(vorhandene_tage)
                         ),
+                        "Hinweis": "Tag in Planung vorhanden, aber in anderer Datei nicht als Liefertag hinterlegt",
                     }
                 )
-                summary_map.setdefault(sap, set()).add(day)
 
-    details = pd.DataFrame(detail_rows)
-    if not details.empty:
-        details = details.drop_duplicates(subset=["SAP Nummer", "Liefertag Nummer", "Blatt Datei 2", "Zeile Datei 2"])
-        details = details.sort_values(["SAP Nummer", "Liefertag Nummer", "Blatt Datei 2", "Zeile Datei 2"]).reset_index(drop=True)
-
-    summary_rows: List[dict] = []
-    for sap, days in sorted(summary_map.items(), key=lambda item: item[0]):
-        summary_rows.append(
-            {
-                "SAP Nummer": sap,
-                "Neue Tage in Datei 2": ", ".join(f"{day} {DAY_NAMES[day]}" for day in sorted(days)),
-                "Anzahl neue Tage": len(days),
-            }
+    result_df = pd.DataFrame(result_rows)
+    if not result_df.empty:
+        result_df = result_df.drop_duplicates(
+            subset=["SAP Nummer", "Fehlender Liefertag Nummer", "Blatt Planung", "Zeile Planung"]
         )
+        result_df = result_df.sort_values(
+            ["SAP Nummer", "Fehlender Liefertag Nummer", "Blatt Planung", "Zeile Planung"]
+        ).reset_index(drop=True)
 
-    summary = pd.DataFrame(summary_rows)
-    return details, summary, sheet_names
+    return result_df, sheet_names
 
 
-def build_excel(details: pd.DataFrame, summary: pd.DataFrame, extract_file1: pd.DataFrame, info: pd.DataFrame) -> bytes:
+def build_excel(result_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary.to_excel(writer, index=False, sheet_name="Uebersicht")
-        details.to_excel(writer, index=False, sheet_name="Neu in Datei 2")
-        extract_file1.to_excel(writer, index=False, sheet_name="Datei 1 Extrakt")
-        info.to_excel(writer, index=False, sheet_name="Info")
+        result_df.to_excel(writer, index=False, sheet_name="Fehlt in anderer Datei")
     return output.getvalue()
 
 
-def make_info_df(
-    file1_name: str,
-    file2_name: str,
-    file1_sheet: str,
-    file2_sheets: List[str],
-    selected_count: int,
-    summary: pd.DataFrame,
-    details: pd.DataFrame,
-) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {"Feld": "Datei 1", "Wert": file1_name},
-            {"Feld": "Datei 1 Blatt", "Wert": file1_sheet},
-            {"Feld": "Datei 2", "Wert": file2_name},
-            {"Feld": "Geprüfte Blätter Datei 2", "Wert": ", ".join(file2_sheets)},
-            {"Feld": "Anzahl ausgewählte SAP Nummern", "Wert": selected_count},
-            {"Feld": "SAP Nummern mit neuen Tagen in Datei 2", "Wert": len(summary)},
-            {"Feld": "Anzahl Trefferzeilen", "Wert": len(details)},
-            {"Feld": "Logik", "Wert": "Es werden nur Tage ausgegeben, die in Datei 2 vorhanden sind und in Datei 1 nicht vorhanden sind."},
-        ]
-    )
+st.set_page_config(page_title="Planung gegen Liefertage", layout="wide")
 
-
-st.set_page_config(page_title="Liefertage nur neu in Datei 2", layout="wide")
-
-st.title("Liefertage: nur neue Tage aus Datei 2")
+st.title("Planung gegen Liefertag-Datei")
 st.write(
-    "Diese App erzeugt nur eine Excel-Datei. "
-    "Geprüft wird ausschließlich, ob in Datei 2 Liefertage vorhanden sind, die in Datei 1 nicht vorhanden sind."
+    "Es wird nur eines geprüft: "
+    "Steht in der Planung auf Montag bis Samstag ein Tag, "
+    "dann muss dieser Tag auch in der anderen Datei als Liefertag hinterlegt sein."
+)
+
+st.info(
+    "Richtung des Vergleichs:\n"
+    "- Planung = Datei mit Spalte B sowie Montag bis Samstag in G bis L\n"
+    "- Andere Datei = Datei mit SAP Nummer in A und Liefertag in G\n"
+    "Ausgegeben wird nur, was in der Planung steht, aber in der anderen Datei fehlt."
 )
 
 with st.expander("SAP Nummern", expanded=False):
@@ -360,23 +317,23 @@ with st.expander("SAP Nummern", expanded=False):
         height=320,
     )
 
-file1 = st.file_uploader(
-    "Datei 1 hochladen – erstes Blatt, Spalte A = SAP Nummer, Spalte G = Liefertag 1 bis 6",
+liefertag_datei = st.file_uploader(
+    "Andere Datei hochladen – erstes Blatt, Spalte A = SAP Nummer, Spalte G = Liefertag 1 bis 6",
     type=["xlsx", "xlsm", "xls"],
-    key="file1",
+    key="liefertag_datei",
 )
 
-file2 = st.file_uploader(
-    "Datei 2 hochladen – erste vier Blätter, Spalte B = SAP Nummer, Spalte G bis L = Montag bis Samstag",
+planung_datei = st.file_uploader(
+    "Planung hochladen – erste 4 Blätter, Spalte B = SAP Nummer, Spalte G bis L = Montag bis Samstag",
     type=["xlsx", "xlsm", "xls"],
-    key="file2",
+    key="planung_datei",
 )
 
 if st.button("Excel erzeugen", type="primary"):
     selected_list = parse_sap_list(sap_text)
     selected_set = set(selected_list)
 
-    if not file1 or not file2:
+    if not liefertag_datei or not planung_datei:
         st.error("Bitte beide Excel-Dateien hochladen.")
         st.stop()
 
@@ -385,28 +342,29 @@ if st.button("Excel erzeugen", type="primary"):
         st.stop()
 
     try:
-        days_file1, extract_file1, file1_sheet = file1_days(file1, selected_set)
-        details, summary, file2_sheets = file2_new_days(file2, selected_set, days_file1)
-
-        info = make_info_df(
-            file1_name=file1.name,
-            file2_name=file2.name,
-            file1_sheet=file1_sheet,
-            file2_sheets=file2_sheets,
-            selected_count=len(selected_list),
-            summary=summary,
-            details=details,
+        days_other_file, other_sheet = read_liefertag_datei(liefertag_datei, selected_set)
+        result_df, planung_sheets = compare_planung_against_liefertage(
+            planung_datei,
+            selected_set,
+            days_other_file,
         )
 
-        excel_bytes = build_excel(details, summary, extract_file1, info)
+        excel_bytes = build_excel(result_df)
 
         st.success(
-            f"Fertig. Gefunden wurden {len(details)} Zeilen mit Tagen, die nur in Datei 2 vorhanden sind."
+            f"Fertig. Gefunden wurden {len(result_df)} Zeilen, die in der Planung stehen, "
+            f"aber in der anderen Datei als Liefertag fehlen."
         )
+
+        st.caption(
+            f"Andere Datei: erstes Blatt = {other_sheet} | "
+            f"Planung: geprüfte Blätter = {', '.join(planung_sheets)}"
+        )
+
         st.download_button(
             label="Excel herunterladen",
             data=excel_bytes,
-            file_name="liefertage_nur_neu_in_datei2.xlsx",
+            file_name="planung_tage_fehlend_in_anderer_datei.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except Exception as exc:
