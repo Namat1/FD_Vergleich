@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # ---------------------------------------------------------------------------
@@ -464,18 +464,66 @@ def _empty_result_df() -> pd.DataFrame:
 
 
 
-def interleave_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Fügt nach jeder Datenzeile außer der letzten eine komplett leere Zeile ein."""
-    if df.empty or len(df) <= 1:
-        return df.reset_index(drop=True)
-    blank = pd.DataFrame([[pd.NA] * len(df.columns)], columns=df.columns)
-    pieces: List[pd.DataFrame] = []
-    for i in range(len(df)):
-        pieces.append(df.iloc[[i]])
-        if i < len(df) - 1:
-            pieces.append(blank)
-    return pd.concat(pieces, ignore_index=True)
+def _add_count_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Fügt eine Hilfsspalte 'Anzahl LT' (Anzahl fehlender Liefertage) hinzu
+    und positioniert sie hinter 'SAP Nummer'. Nur sinnvoll für Sheets mit
+    'Fehlende LT'-Spalte."""
+    if df is None or df.empty or "Fehlende LT" not in df.columns:
+        return df
+    out = df.copy()
+    out["Anzahl LT"] = out["Fehlende LT"].fillna("").map(
+        lambda s: len([t for t in str(s).split(",") if t.strip()])
+    )
+    cols = list(out.columns)
+    cols.remove("Anzahl LT")
+    if "SAP Nummer" in cols:
+        idx = cols.index("SAP Nummer") + 1
+        cols.insert(idx, "Anzahl LT")
+    else:
+        cols.insert(0, "Anzahl LT")
+    return out[cols]
 
+
+def _filter_dataframe(df: pd.DataFrame, suche: str, standort: Optional[str] = None) -> pd.DataFrame:
+    """Filtert nach Freitext (SAP, Name, Straße, Ort) und optional Standort."""
+    if df is None or df.empty:
+        return df
+    work = df
+    if standort and standort != "Alle" and "Standort" in work.columns:
+        work = work[work["Standort"] == standort]
+    if suche:
+        such = suche.strip().lower()
+        if such:
+            spalten = [c for c in ["SAP Nummer", "Name", "Straße", "Ort"] if c in work.columns]
+            mask = pd.Series(False, index=work.index)
+            for c in spalten:
+                mask = mask | work[c].astype(str).str.lower().str.contains(such, na=False)
+            work = work[mask]
+    return work
+
+
+def _standort_uebersicht(missing_sap: pd.DataFrame, missing_tour: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Aggregiert pro Standort: Anzahl betroffener Kunden in beiden Richtungen."""
+    rows = []
+    for standort in CUSTOMER_GROUPS.keys():
+        gesamt = len(CUSTOMER_GROUPS[standort])
+        betr_sap = (
+            int((missing_sap["Standort"] == standort).sum())
+            if missing_sap is not None and not missing_sap.empty and "Standort" in missing_sap.columns
+            else 0
+        )
+        betr_tour = (
+            int((missing_tour["Standort"] == standort).sum())
+            if missing_tour is not None and not missing_tour.empty and "Standort" in missing_tour.columns
+            else 0
+        )
+        rows.append({
+            "Standort": standort,
+            "Kunden gesamt": gesamt,
+            "Fehlt in SAP": betr_sap,
+            "Fehlt in Tourenplanung": betr_tour,
+        })
+    return pd.DataFrame(rows)
 
 
 def build_excel(
@@ -483,53 +531,157 @@ def build_excel(
     missing_tour: pd.DataFrame | None,
     unknown_saps: pd.DataFrame | None,
 ) -> bytes:
-    """Schreibt eine formatierte Excel-Datei mit bis zu drei Blättern.
-    Zwischen jedem Kunden wird eine Leerzeile eingefügt."""
+    """Schreibt eine formatierte Excel-Datei mit bis zu drei Blättern."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        missing_sap_out = interleave_blank_rows(missing_sap)
+        missing_sap_out = _add_count_column(missing_sap)
         missing_sap_out.to_excel(writer, index=False, sheet_name="Fehlt in SAP", na_rep="")
         _format_sheet(writer, "Fehlt in SAP", missing_sap_out)
 
         if missing_tour is not None:
-            missing_tour_out = interleave_blank_rows(missing_tour)
+            missing_tour_out = _add_count_column(missing_tour)
             missing_tour_out.to_excel(writer, index=False, sheet_name="Fehlt in Tourenplanung", na_rep="")
             _format_sheet(writer, "Fehlt in Tourenplanung", missing_tour_out)
 
         if unknown_saps is not None and not unknown_saps.empty:
-            unknown_out = interleave_blank_rows(unknown_saps)
-            unknown_out.to_excel(writer, index=False, sheet_name="Unbekannte SAP-Nummern", na_rep="")
-            _format_sheet(writer, "Unbekannte SAP-Nummern", unknown_out)
+            unknown_saps.to_excel(writer, index=False, sheet_name="Unbekannte SAP-Nummern", na_rep="")
+            _format_sheet(writer, "Unbekannte SAP-Nummern", unknown_saps)
+
+        # Defensiv: Default-Sheet aufräumen, alle Sheets sichtbar
+        wb = writer.book
+        for ws in list(wb.worksheets):
+            if ws.title == "Sheet" and ws.max_row == 1 and ws.max_column == 1:
+                wb.remove(ws)
+        for ws in wb.worksheets:
+            ws.sheet_state = "visible"
+        if not wb.worksheets:
+            wb.create_sheet("Fehlt in SAP")
 
     return output.getvalue()
 
+
+# Spalten, die rechtsbündig dargestellt werden (Zahlen)
+_RIGHT_ALIGN_COLS = {"SAP Nummer", "Anzahl LT", "Gesamt-Vorkommen"}
+
+# Empfohlene Mindest-/Maximal-Breiten je Spalte
+_COL_WIDTH_HINTS = {
+    "Standort": (12, 16),
+    "SAP Nummer": (10, 12),
+    "Anzahl LT": (10, 11),
+    "Name": (24, 42),
+    "Straße": (20, 32),
+    "Ort": (22, 36),
+    "Fehlende LT": (24, 48),
+    "LT SAP": (24, 48),
+    "LT Tourenplanung": (24, 48),
+    "Blätter Tourenplanung": (22, 40),
+    "Gesamt-Vorkommen": (10, 14),
+}
 
 
 def _format_sheet(writer, sheet_name: str, df: pd.DataFrame) -> None:
     if df is None:
         return
     ws = writer.sheets[sheet_name]
+    n_rows = len(df)
+    n_cols = len(df.columns)
 
+    # Farben
     header_fill = PatternFill(start_color="FF305496", end_color="FF305496", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFFFF")
-    header_align = Alignment(horizontal="left", vertical="center")
-    for col_idx in range(1, len(df.columns) + 1):
+    zebra_fill = PatternFill(start_color="FFE8EFF7", end_color="FFE8EFF7", fill_type="solid")
+
+    # Borders
+    thin = Side(style="thin", color="FFCBD5E0")
+    medium = Side(style="medium", color="FF305496")
+    border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFFFF")
+    body_font = Font(name="Calibri", size=11)
+    align_left = Alignment(horizontal="left", vertical="center", wrap_text=False)
+    align_right = Alignment(horizontal="right", vertical="center", wrap_text=False)
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+    # Header formatieren
+    for col_idx in range(1, n_cols + 1):
         cell = ws.cell(row=1, column=col_idx)
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = header_align
+        cell.alignment = align_left
+        cell.border = border_thin
+    ws.row_dimensions[1].height = 24
 
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        max_len = max(
-            [len(str(col_name))] +
-            [len(str(v)) for v in df[col_name].astype(str).head(200).tolist()]
-        )
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 12), 60)
+    # Standort-Spalte ermitteln (für dicke Trennlinie bei Wechsel)
+    columns = list(df.columns)
+    standort_idx = columns.index("Standort") if "Standort" in columns else None
+    standort_values = df["Standort"].tolist() if standort_idx is not None else []
 
+    # Datenzeilen formatieren
+    for row_offset in range(n_rows):
+        excel_row = row_offset + 2
+        is_zebra = (row_offset % 2) == 1
+
+        new_group = False
+        if standort_idx is not None and row_offset > 0:
+            if standort_values[row_offset] != standort_values[row_offset - 1]:
+                new_group = True
+
+        ws.row_dimensions[excel_row].height = 20
+
+        for col_idx, col_name in enumerate(columns, start=1):
+            cell = ws.cell(row=excel_row, column=col_idx)
+            cell.font = body_font
+
+            if col_name in {"Anzahl LT", "Gesamt-Vorkommen"}:
+                cell.alignment = align_center
+            elif col_name in _RIGHT_ALIGN_COLS:
+                cell.alignment = align_right
+            else:
+                cell.alignment = align_left
+
+            if is_zebra:
+                cell.fill = zebra_fill
+
+            top_side = medium if new_group else thin
+            cell.border = Border(left=thin, right=thin, top=top_side, bottom=thin)
+
+    # Spaltenbreiten: Hinweise + Inhaltslänge
+    for col_idx, col_name in enumerate(columns, start=1):
+        sample = df[col_name].astype(str).head(300).tolist()
+        max_len = max([len(str(col_name))] + [len(v) for v in sample] + [8])
+        min_w, max_w = _COL_WIDTH_HINTS.get(col_name, (12, 50))
+        width = min(max(max_len + 3, min_w), max_w)
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # Kopfzeile einfrieren + Autofilter
     ws.freeze_panes = "A2"
-    if not df.empty:
-        last_col = get_column_letter(len(df.columns))
-        ws.auto_filter.ref = f"A1:{last_col}{len(df) + 1}"
+    if n_rows > 0:
+        last_col = get_column_letter(n_cols)
+        ws.auto_filter.ref = f"A1:{last_col}{n_rows + 1}"
+
+    # Conditional Formatting für 'Anzahl LT': je höher, desto roter
+    if "Anzahl LT" in columns and n_rows > 0:
+        from openpyxl.formatting.rule import ColorScaleRule
+        col_letter = get_column_letter(columns.index("Anzahl LT") + 1)
+        rng = f"{col_letter}2:{col_letter}{n_rows + 1}"
+        rule = ColorScaleRule(
+            start_type="num", start_value=1, start_color="FFD4EDDA",
+            mid_type="num", mid_value=3, mid_color="FFFFE699",
+            end_type="num", end_value=6, end_color="FFF4B084",
+        )
+        ws.conditional_formatting.add(rng, rule)
+
+    # Druck: Querformat und Kopfzeile auf jeder Seite. Defensiv ohne Properties,
+    # die in manchen openpyxl-Versionen "At least one sheet must be visible" auslösen.
+    try:
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+        ws.print_options.gridLines = False
+        if n_rows > 0:
+            ws.print_title_rows = "1:1"
+    except Exception:
+        pass
+
+    # Sicherstellen, dass das Sheet sichtbar ist
+    ws.sheet_state = "visible"
 
 
 
@@ -632,7 +784,10 @@ if run:
             "tour_sheets": tour_sheets,
         }
     except Exception as exc:
+        import traceback
         st.error(f"Fehler beim Verarbeiten der Dateien: {exc}")
+        with st.expander("Technische Details", expanded=False):
+            st.code(traceback.format_exc(), language="python")
         st.session_state.pop("result", None)
 
 result = st.session_state.get("result")
@@ -641,41 +796,103 @@ if result:
     missing_tour = result["missing_tour"]
     unknown_saps = result["unknown_saps"]
 
-    st.success(
-        f"Fertig. {len(missing_sap)} Kunden mit Tagen in der Tourenplanung, "
-        f"die in SAP als Liefertag fehlen."
-    )
+    st.divider()
 
-    st.caption(
-        f"SAP: Blatt = {result['sap_sheet']}, {result['sap_rows']} Liefertage übernommen | "
-        f"Tourenplanung: geprüfte Blätter = {', '.join(result['tour_sheets'])}"
-    )
-
-    if not missing_sap.empty:
-        standort_zaehlung = (
-            missing_sap.groupby("Standort", as_index=False)
-            .agg({"SAP Nummer": "count"})
-            .rename(columns={"SAP Nummer": "Betroffene Kunden"})
+    # Kopfzeile: Titel + Download rechts
+    head_left, head_right = st.columns([3, 1])
+    with head_left:
+        st.subheader("Ergebnis")
+        st.caption(
+            f"SAP: Blatt **{result['sap_sheet']}**, {result['sap_rows']} Liefertage übernommen · "
+            f"Tourenplanung: {', '.join(result['tour_sheets'])}"
         )
-        st.dataframe(standort_zaehlung, use_container_width=True, hide_index=True)
+    with head_right:
+        st.download_button(
+            label="📥 Excel herunterladen",
+            data=result["excel_bytes"],
+            file_name="tourenplanung_tage_fehlen_in_sap_sortiert_mit_adressen.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
-        with st.expander("Vorschau: Fehlt in SAP", expanded=False):
+    # Hauptkennzahlen
+    has_reverse = missing_tour is not None
+    has_unknown = unknown_saps is not None
+    cols_count = 1 + (1 if has_reverse else 0) + (1 if has_unknown else 0)
+    metric_cols = st.columns(max(cols_count, 3))
+    metric_cols[0].metric("Fehlt in SAP", len(missing_sap) if missing_sap is not None else 0)
+    next_idx = 1
+    if has_reverse:
+        metric_cols[next_idx].metric(
+            "Fehlt in Tourenplanung",
+            len(missing_tour) if missing_tour is not None else 0,
+        )
+        next_idx += 1
+    if has_unknown:
+        metric_cols[next_idx].metric(
+            "Unbekannte SAP-Nummern",
+            len(unknown_saps) if unknown_saps is not None else 0,
+        )
+
+    # Tabs
+    tab_labels = [
+        "📊 Übersicht",
+        f"🟢 Fehlt in SAP ({len(missing_sap) if missing_sap is not None else 0})",
+    ]
+    if has_reverse:
+        tab_labels.append(f"🔵 Fehlt in Tourenplanung ({len(missing_tour) if missing_tour is not None else 0})")
+    if has_unknown:
+        tab_labels.append(f"🟣 Unbekannte SAP-Nummern ({len(unknown_saps) if unknown_saps is not None else 0})")
+
+    tabs = st.tabs(tab_labels)
+
+    # --- Tab Übersicht ---
+    with tabs[0]:
+        ueb = _standort_uebersicht(missing_sap, missing_tour)
+        if not has_reverse:
+            ueb = ueb.drop(columns=["Fehlt in Tourenplanung"])
+        st.markdown("**Pro Standort betroffene Kunden**")
+        st.dataframe(ueb, use_container_width=True, hide_index=True)
+
+        if missing_sap is None or missing_sap.empty:
+            st.success("✅ Keine Kunden mit Tagen in der Tourenplanung, die in SAP fehlen.")
+
+    # --- Tab Fehlt in SAP ---
+    with tabs[1]:
+        if missing_sap is None or missing_sap.empty:
+            st.info("Keine Treffer.")
+        else:
+            f1, f2 = st.columns([1, 2])
             standorte = ["Alle"] + sorted(missing_sap["Standort"].unique().tolist())
-            filter_wahl = st.selectbox("Standort filtern", standorte, key="filter_missing_sap")
-            vorschau = missing_sap if filter_wahl == "Alle" else missing_sap[missing_sap["Standort"] == filter_wahl]
-            st.dataframe(vorschau, use_container_width=True, hide_index=True)
+            standort_wahl = f1.selectbox("Standort", standorte, key="filter_missing_sap_standort")
+            suche = f2.text_input("Suchen (SAP, Name, Straße, Ort)", key="filter_missing_sap_suche")
+            anz = _add_count_column(_filter_dataframe(missing_sap, suche, standort_wahl))
+            st.caption(f"{len(anz)} von {len(missing_sap)} Zeilen")
+            st.dataframe(anz, use_container_width=True, hide_index=True)
 
-    if missing_tour is not None and not missing_tour.empty:
-        with st.expander(f"Vorschau: Fehlt in Tourenplanung ({len(missing_tour)} Kunden)", expanded=False):
-            st.dataframe(missing_tour, use_container_width=True, hide_index=True)
+    # --- Tab Fehlt in Tourenplanung ---
+    next_tab = 2
+    if has_reverse:
+        with tabs[next_tab]:
+            if missing_tour is None or missing_tour.empty:
+                st.info("Keine Treffer.")
+            else:
+                f1, f2 = st.columns([1, 2])
+                standorte = ["Alle"] + sorted(missing_tour["Standort"].unique().tolist())
+                standort_wahl = f1.selectbox("Standort", standorte, key="filter_missing_tour_standort")
+                suche = f2.text_input("Suchen (SAP, Name, Straße, Ort)", key="filter_missing_tour_suche")
+                anz = _add_count_column(_filter_dataframe(missing_tour, suche, standort_wahl))
+                st.caption(f"{len(anz)} von {len(missing_tour)} Zeilen")
+                st.dataframe(anz, use_container_width=True, hide_index=True)
+        next_tab += 1
 
-    if unknown_saps is not None and not unknown_saps.empty:
-        with st.expander(f"Vorschau: Unbekannte SAP-Nummern ({len(unknown_saps)} Kunden)", expanded=False):
-            st.dataframe(unknown_saps, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        label="Excel herunterladen",
-        data=result["excel_bytes"],
-        file_name="tourenplanung_tage_fehlen_in_sap_sortiert_mit_adressen.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    # --- Tab Unbekannte SAP-Nummern ---
+    if has_unknown:
+        with tabs[next_tab]:
+            if unknown_saps is None or unknown_saps.empty:
+                st.info("Keine unbekannten SAP-Nummern.")
+            else:
+                suche = st.text_input("Suchen (SAP, Name, Straße, Ort)", key="filter_unknown_suche")
+                anz = _filter_dataframe(unknown_saps, suche)
+                st.caption(f"{len(anz)} von {len(unknown_saps)} Zeilen")
+                st.dataframe(anz, use_container_width=True, hide_index=True)
